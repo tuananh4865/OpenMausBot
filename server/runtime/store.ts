@@ -2,6 +2,7 @@
 import { chmodSync, closeSync, mkdirSync, openSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync, type SQLInputValue } from "node:sqlite";
+import { isSqliteHandleHealthy, resilientDatabase, resilientStatement, sqliteFileIdentity } from "../sqlite-recover.ts";
 import { z } from "zod";
 
 import { APPROVAL_MODES } from "../../shared/approval-mode.ts";
@@ -192,41 +193,71 @@ function readEvent(row: Row): AssignmentEvent {
   return event;
 }
 
+const FILE_RECHECK_MS = 1_000;
+
 export function openRuntimeStore(path: string): RuntimeStore {
   const memory = path === ":memory:";
-  if (!memory) {
-    mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-    // Briefs and results are private: owner-only from the first byte, repaired on a file that inherited a loose umask.
-    closeSync(openSync(path, "a", 0o600));
-    try {
-      chmodSync(path, 0o600);
-    } catch {}
-  }
-  const db = new DatabaseSync(path);
-  if (!memory) {
-    db.exec("PRAGMA journal_mode = WAL");
-    db.exec("PRAGMA synchronous = NORMAL");
-  }
-  db.exec(SCHEMA);
+  const openConnection = () => {
+    if (!memory) {
+      mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+      // Briefs and results are private: owner-only from the first byte, repaired on a file that inherited a loose umask.
+      closeSync(openSync(path, "a", 0o600));
+      try { chmodSync(path, 0o600); } catch {}
+    }
+    const conn = new DatabaseSync(path);
+    if (!memory) {
+      conn.exec("PRAGMA journal_mode = WAL");
+      conn.exec("PRAGMA synchronous = NORMAL");
+    }
+    conn.exec(SCHEMA);
+    return {
+      conn,
+      identity: memory ? null : sqliteFileIdentity(path),
+      stmts: {
+        get: conn.prepare("SELECT id, json FROM assignments WHERE id = ?"),
+        children: conn.prepare("SELECT id, json FROM assignments WHERE parent_id = ? ORDER BY created_at, rowid"),
+        insert: conn.prepare(`INSERT INTO assignments (id, root_id, parent_id, status, requester_thread_id, requester_run_id,
+          assignee_bot_id, assignee_thread_id, created_at, finished_at, json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`),
+        update: conn.prepare(`UPDATE assignments SET root_id = ?, parent_id = ?, status = ?, requester_thread_id = ?,
+          requester_run_id = ?, assignee_bot_id = ?, assignee_thread_id = ?, created_at = ?, finished_at = ?, json = ? WHERE id = ?`),
+        event: conn.prepare("INSERT INTO assignment_events (assignment_id, at, kind, detail) VALUES (?, ?, ?, ?)"),
+        events: conn.prepare("SELECT id, assignment_id, at, kind, detail FROM assignment_events WHERE assignment_id = ? ORDER BY id"),
+        addInbox: conn.prepare(`INSERT INTO inbox (id, owner_bot_id, owner_thread_id, owner_run_id, assignment_id, kind, created_at, delivered_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?)`),
+        deliver: conn.prepare("UPDATE inbox SET delivered_at = ? WHERE id = ? AND delivered_at IS NULL"),
+        prunable: conn.prepare(`SELECT id FROM assignments r WHERE r.parent_id IS NULL AND r.status IN (${terminalList})
+          AND r.finished_at IS NOT NULL AND r.finished_at < ?
+          AND NOT EXISTS (SELECT 1 FROM assignments c WHERE c.root_id = r.id AND c.status NOT IN (${terminalList}))`),
+        pruneEvents: conn.prepare("DELETE FROM assignment_events WHERE assignment_id IN (SELECT id FROM assignments WHERE root_id = ?)"),
+        pruneInbox: conn.prepare("DELETE FROM inbox WHERE assignment_id IN (SELECT id FROM assignments WHERE root_id = ?)"),
+        pruneRows: conn.prepare("DELETE FROM assignments WHERE root_id = ?"),
+      },
+    };
+  };
 
+  let state = openConnection();
+  let checkedAt = Date.now();
+  const reopen = () => {
+    if (memory) return state.conn;
+    try { state.conn.close(); } catch {}
+    state = openConnection();
+    checkedAt = Date.now();
+    return state.conn;
+  };
+  const activeState = () => {
+    if (!memory && Date.now() - checkedAt >= FILE_RECHECK_MS) {
+      if (isSqliteHandleHealthy(state.conn, path, state.identity)) checkedAt = Date.now();
+      else reopen();
+    }
+    return state;
+  };
+  const db = resilientDatabase(() => activeState().conn, reopen);
+  const stmt = <K extends keyof typeof state.stmts>(key: K) =>
+    resilientStatement(() => activeState().stmts[key], reopen);
   const statements = {
-    get: db.prepare("SELECT id, json FROM assignments WHERE id = ?"),
-    children: db.prepare("SELECT id, json FROM assignments WHERE parent_id = ? ORDER BY created_at, rowid"),
-    insert: db.prepare(`INSERT INTO assignments (id, root_id, parent_id, status, requester_thread_id, requester_run_id,
-      assignee_bot_id, assignee_thread_id, created_at, finished_at, json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`),
-    update: db.prepare(`UPDATE assignments SET root_id = ?, parent_id = ?, status = ?, requester_thread_id = ?,
-      requester_run_id = ?, assignee_bot_id = ?, assignee_thread_id = ?, created_at = ?, finished_at = ?, json = ? WHERE id = ?`),
-    event: db.prepare("INSERT INTO assignment_events (assignment_id, at, kind, detail) VALUES (?, ?, ?, ?)"),
-    events: db.prepare("SELECT id, assignment_id, at, kind, detail FROM assignment_events WHERE assignment_id = ? ORDER BY id"),
-    addInbox: db.prepare(`INSERT INTO inbox (id, owner_bot_id, owner_thread_id, owner_run_id, assignment_id, kind, created_at, delivered_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`),
-    deliver: db.prepare("UPDATE inbox SET delivered_at = ? WHERE id = ? AND delivered_at IS NULL"),
-    prunable: db.prepare(`SELECT id FROM assignments r WHERE r.parent_id IS NULL AND r.status IN (${terminalList})
-      AND r.finished_at IS NOT NULL AND r.finished_at < ?
-      AND NOT EXISTS (SELECT 1 FROM assignments c WHERE c.root_id = r.id AND c.status NOT IN (${terminalList}))`),
-    pruneEvents: db.prepare("DELETE FROM assignment_events WHERE assignment_id IN (SELECT id FROM assignments WHERE root_id = ?)"),
-    pruneInbox: db.prepare("DELETE FROM inbox WHERE assignment_id IN (SELECT id FROM assignments WHERE root_id = ?)"),
-    pruneRows: db.prepare("DELETE FROM assignments WHERE root_id = ?"),
+    get: stmt("get"), children: stmt("children"), insert: stmt("insert"), update: stmt("update"),
+    event: stmt("event"), events: stmt("events"), addInbox: stmt("addInbox"), deliver: stmt("deliver"),
+    prunable: stmt("prunable"), pruneEvents: stmt("pruneEvents"), pruneInbox: stmt("pruneInbox"), pruneRows: stmt("pruneRows"),
   };
 
   let depth = 0;
@@ -348,7 +379,7 @@ export function openRuntimeStore(path: string): RuntimeStore {
       });
     },
     close() {
-      db.close();
+      state.conn.close();
     },
   };
 }

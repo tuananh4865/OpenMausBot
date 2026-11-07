@@ -64,6 +64,28 @@ describe("message-db", () => {
     expect(thread.activeLeafId).toBe("m2");
   });
 
+  it("automatically reopens messages.db when the database file is replaced or its descriptor is revoked", () => {
+    insertMessage("t1", msg("m1", "before remount"));
+    expect(readThread("t1", legacy("t1")).messages.map((m) => m.text)).toEqual(["before remount"]);
+
+    // Simulate an external volume remount or file replacement under the open handle
+    rmSync(join(DATA_DIR, "messages.db"), { force: true });
+    rmSync(join(DATA_DIR, "messages.db-wal"), { force: true });
+    rmSync(join(DATA_DIR, "messages.db-shm"), { force: true });
+    const replacement = new DatabaseSync(join(DATA_DIR, "messages.db"));
+    replacement.close();
+
+    // Advance past FILE_RECHECK_MS so db() probes the handle against the replaced file
+    const realNow = Date.now;
+    Date.now = () => realNow() + 2_000;
+    try {
+      insertMessage("t1", msg("m2", "after remount"));
+      expect(readThread("t1", legacy("t1")).messages.map((m) => m.text)).toEqual(["after remount"]);
+    } finally {
+      Date.now = realNow;
+    }
+  });
+
   it("finds the first-reply rescue rows that never settled or ended", () => {
     const rescue = (id: string, state: Record<string, true> = {}) => msg(id, "", {
       role: "bot", kind: "activity",

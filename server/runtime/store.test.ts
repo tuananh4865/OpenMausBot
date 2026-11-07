@@ -1,4 +1,4 @@
-import { mkdtempSync, statSync } from "node:fs";
+import { mkdtempSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -177,6 +177,35 @@ describe("runtime store", () => {
       const again = openRuntimeStore(path);
       expect(again.get("root")?.brief).toBe("Ship it");
       again.close();
+    } finally {
+      await removeTempDir(dir);
+    }
+  });
+
+  it("automatically reopens runtime.db when the handle is closed or revoked across a volume remount", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "runtime-store-"));
+    try {
+      const path = join(dir, "runtime.db");
+      const store = openRuntimeStore(path);
+      store.insert(assignment("before"), { kind: "enqueued" });
+      expect(store.get("before")?.id).toBe("before");
+
+      // Simulate an external volume remount or revoked handle (ERR_INVALID_STATE / missing file)
+      store.close();
+      expect(store.get("before")?.id).toBe("before");
+
+      rmSync(path, { force: true });
+      rmSync(`${path}-wal`, { force: true });
+      rmSync(`${path}-shm`, { force: true });
+      const realNow = Date.now;
+      Date.now = () => realNow() + 2_000;
+      try {
+        store.insert(assignment("after"), { kind: "enqueued" });
+        expect(store.get("after")?.id).toBe("after");
+      } finally {
+        Date.now = realNow;
+      }
+      store.close();
     } finally {
       await removeTempDir(dir);
     }

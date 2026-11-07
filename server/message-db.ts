@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
-import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, renameSync } from "node:fs";
+import { chmodSync, closeSync, mkdirSync, openSync, readFileSync, renameSync } from "node:fs";
 import { join } from "node:path";
 import { DatabaseSync, type StatementSync } from "node:sqlite";
+import { isSqliteHandleHealthy, resilientDatabase, resilientStatement, sqliteFileIdentity } from "./sqlite-recover.ts";
 
 import { DATA_DIR } from "./config.ts";
 import { peerProvenanceAuthor, type WorkOrigin } from "./peer-provenance.ts";
@@ -23,6 +24,7 @@ const FAILED_CALL = "kind = 'activity' AND instr(json, '\"ok\":false') > 0";
 
 let handle: DatabaseSync | null = null;
 let handlePath: string | null = null;
+let handleIdentity: string | null = null;
 let handleCheckedAt = 0;
 let statements = new Map<string, StatementSync>();
 /** SQLite keeps writing to a database file deleted under it without an error, so the file is looked for again this often. */
@@ -35,9 +37,7 @@ function open(): DatabaseSync {
   const file = DB_FILE();
   // Transcripts are private: owner-only mode, also repairing an existing file's permissive umask.
   closeSync(openSync(file, "a", 0o600));
-  try {
-    chmodSync(file, 0o600);
-  } catch {}
+  try { chmodSync(file, 0o600); } catch {}
   const db = new DatabaseSync(file);
   db.exec("PRAGMA journal_mode = WAL");
   db.exec("PRAGMA synchronous = NORMAL");
@@ -148,29 +148,31 @@ const UPSERT_MESSAGE =
   "text = excluded.text, json = excluded.json";
 
 const ACTIVE_LEAF = "SELECT active_leaf_id FROM thread_state WHERE thread_id = ?";
-function db(): DatabaseSync {
+function rawDb(forceReopen = false): DatabaseSync {
   const file = DB_FILE();
-  if (handle && handlePath === file && Date.now() - handleCheckedAt < FILE_RECHECK_MS) return handle;
-  if (handle && handlePath === file && existsSync(file)) {
+  if (!forceReopen && handle && handlePath === file && Date.now() - handleCheckedAt < FILE_RECHECK_MS) return handle;
+  if (!forceReopen && handle && handlePath === file && isSqliteHandleHealthy(handle, file, handleIdentity)) {
     handleCheckedAt = Date.now();
     return handle;
   }
-  try {
-    handle?.close();
-  } catch {}
+  try { handle?.close(); } catch {}
   statements = new Map();
   handle = open();
   handlePath = file;
+  handleIdentity = sqliteFileIdentity(file);
   handleCheckedAt = Date.now();
   return handle;
 }
+const db = (): DatabaseSync => resilientDatabase(() => rawDb(false), () => rawDb(true));
 
 /** One prepared statement per SQL text for the life of the open database. */
 function prepared(sql: string): StatementSync {
-  const database = db();
-  let statement = statements.get(sql);
-  if (!statement) statements.set(sql, statement = database.prepare(sql));
-  return statement;
+  return resilientStatement(() => {
+    const database = rawDb(false);
+    let statement = statements.get(sql);
+    if (!statement) statements.set(sql, statement = database.prepare(sql));
+    return statement;
+  }, () => rawDb(true));
 }
 
 let transactionDepth = 0;
@@ -199,9 +201,7 @@ function transaction<T>(fn: (database: DatabaseSync) => T): T {
   } catch (error) {
     database.exec("ROLLBACK");
     throw error;
-  } finally {
-    transactionDepth = 0;
-  }
+  } finally { transactionDepth = 0; }
 }
 
 export interface FollowupPayload {
@@ -991,10 +991,9 @@ export async function closeMessageSearch(): Promise<void> {
 
 export function closeMessageDb(): void {
   void closeMessageSearch();
-  try {
-    handle?.close();
-  } catch {}
+  try { handle?.close(); } catch {}
   handle = null;
   handlePath = null;
+  handleIdentity = null;
   statements = new Map();
 }
